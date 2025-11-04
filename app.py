@@ -238,6 +238,62 @@ async def analyze_json(body: AnalyzeJSON):
         "threats": scan_threats(board),
         "opening_book": opening_suggestions(fen),
     }
+# ---------- Chess.com: current Daily games ----------
+from pydantic import BaseModel
+import httpx
+
+class CurrentGamesRequest(BaseModel):
+    username: str
+
+@app.post("/chesscom/currentGames")
+async def chesscom_current_games(req: CurrentGamesRequest):
+    """
+    Body: {"username":"redlegs27"}
+    Returns a compact list of current Daily (correspondence) games with url, sides, whose turn, FEN and PGN.
+    """
+    uname = (req.username or "").strip().lower()
+    if not uname:
+        return JSONResponse({"error": "missing_username"}, status_code=422)
+
+    url = f"https://api.chess.com/pub/player/{uname}/games"
+
+    try:
+        async with httpx.AsyncClient(timeout=15, headers={"User-Agent": "chess-coach/1.0"}) as client:
+            r = await client.get(url)
+    except httpx.RequestError as e:
+        # Network issue / timeout talking to Chess.com
+        return JSONResponse({"error": "chesscom_unreachable", "detail": str(e)}, status_code=502)
+
+    if r.status_code == 404:
+        return JSONResponse({"error": "user_not_found", "username": uname}, status_code=404)
+    if r.status_code >= 500:
+        return JSONResponse({"error": "chesscom_server_error", "status": r.status_code}, status_code=502)
+    if r.status_code != 200:
+        return JSONResponse({"error": "chesscom_bad_status", "status": r.status_code}, status_code=502)
+
+    data = r.json()
+    raw_games = data.get("games") or []
+
+    def _name(side):
+        v = side or {}
+        # Chess.com sometimes returns a dict; sometimes a string
+        if isinstance(v, dict):
+            return v.get("username")
+        return v
+
+    games = []
+    for g in raw_games:
+        games.append({
+            "url": g.get("url"),
+            "white": _name(g.get("white")),
+            "black": _name(g.get("black")),
+            "turn": g.get("turn"),          # "white" or "black" if present
+            "fen": g.get("fen"),
+            "pgn": g.get("pgn"),
+            "time_control": g.get("time_control"),
+        })
+
+    return {"count": len(games), "games": games}
 
 @app.post("/analyze")
 async def analyze(
