@@ -1,4 +1,4 @@
-import io, os, re
+import io, os, re, time
 from typing import Optional, List, Dict
 
 from fastapi import FastAPI, UploadFile, File, Form, Query
@@ -6,19 +6,25 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
 from PIL import Image
 
-import chess, chess.engine
+import chess, chess.engine, chess.pgn
 import requests
 import httpx
 from dotenv import load_dotenv
 
 # ---------- init ----------
 load_dotenv()
-app = FastAPI(title="Chess Coach Backend", version="1.0.0")
+app = FastAPI(title="Chess Coach Backend", version="1.1.0")
 
 STOCKFISH_PATH = os.getenv("STOCKFISH_PATH", "")
 USE_CLOUD = os.getenv("USE_CLOUD", "0") == "1"
 STOCKFISH_SECONDS = float(os.getenv("STOCKFISH_SECONDS", "1.2"))
 USE_EXPLORER = os.getenv("USE_EXPLORER", "1") == "1"
+
+# Compliant User-Agent for Chess.com API (required by their API policy)
+CHESSCOM_UA = os.getenv(
+    "CHESSCOM_USER_AGENT",
+    "ChessCoach/1.1 (+https://chess-coach.onrender.com/help; contact chesscoachgpt.help@gmail.com)"
+)
 
 # ---------- optional image->FEN ----------
 try:
@@ -62,7 +68,7 @@ def scan_threats(board: chess.Board) -> Dict[str, List[str]]:
         if board.is_capture(move): captures.append(board.san(move))
         if b2.is_game_over() and b2.result() in ("1-0","0-1"):
             mates_in1.append(board.san(move))
-    # Opponent next move (null move trick)
+    # Opponent threats (null move trick)
     b = board.copy(stack=False); b.push(chess.Move.null())
     opp_threats = []
     for mv in b.legal_moves:
@@ -147,7 +153,7 @@ def board_from_moves_san(moves_san: str, start_fen: Optional[str] = None) -> che
     board = chess.Board(start_fen) if start_fen else chess.Board()
     tokens = [t for t in re.split(r"\s+", moves_san.strip()) if t]
     for t in tokens:
-        if re.match(r"^\d+\.*\.?$", t):  # '1.' or '1...'
+        if re.match(r"^\d+\.*\.?$", t):
             continue
         if t in {"1-0", "0-1", "1/2-1/2", "*"}:
             break
@@ -235,25 +241,43 @@ async def analyze_from_moves(payload: dict):
     fen = board.fen()
     return _analyze_board(board, fen)
 
-# ---------- Chess.com helpers (Daily games) ----------
+# ---------- Chess.com helpers (Daily games) with UA + retries ----------
 CHESSCOM_BASE = "https://api.chess.com/pub"
 
 def _username(u: str) -> str:
     return (u or "").strip().lower()
 
+async def _httpx_get_json(url: str, max_tries: int = 3, backoff: float = 0.8):
+    last = None
+    async with httpx.AsyncClient(timeout=10, headers={"User-Agent": CHESSCOM_UA}) as client:
+        for i in range(max_tries):
+            try:
+                r = await client.get(url)
+                if r.status_code == 200:
+                    return r.json()
+                # transient server errors
+                if r.status_code >= 500:
+                    last = f"{r.status_code} {r.text[:200]}"
+                    time.sleep(backoff * (2 ** i))
+                    continue
+                # client errors—return immediately with detail
+                return JSONResponse({"error": f"http_{r.status_code}", "detail": r.text[:300]}, status_code=502)
+            except Exception as e:
+                last = str(e)
+                time.sleep(backoff * (2 ** i))
+    return JSONResponse({"error": "fetch_failed", "detail": last}, status_code=502)
+
 @app.get("/chesscom/current-games/{username}")
 async def chesscom_current_games(username: str):
     """
-    Returns current Daily (correspondence) games for the user.
-    Each item includes: url, white, black, fen (if present), turn, last_activity, pgn_url (if present)
+    Lists current Daily (correspondence) games for the user.
+    Each item includes: url, players, turn, last_activity, fen (if present), pgn_url (if present).
     """
     user = _username(username)
     url = f"{CHESSCOM_BASE}/player/{user}/games"
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(url)
-        if r.status_code != 200:
-            return JSONResponse({"error": f"fetch_failed {r.status_code}"}, status_code=502)
-        data = r.json() or {}
+    data = await _httpx_get_json(url)
+    if isinstance(data, JSONResponse):
+        return data
     games = []
     for g in data.get("games", []):
         games.append({
@@ -267,29 +291,60 @@ async def chesscom_current_games(username: str):
         })
     return {"username": user, "games": games}
 
+def _board_from_pgn_text(pgn_text: str) -> Optional[chess.Board]:
+    try:
+        game = chess.pgn.read_game(io.StringIO(pgn_text))
+        if not game:
+            return None
+        board = game.board()
+        for mv in game.mainline_moves():
+            board.push(mv)
+        return board
+    except Exception:
+        return None
+
 @app.get("/chesscom/analyze-current")
 async def chesscom_analyze_current(username: str = Query(...), game_url: Optional[str] = Query(None)):
     """
-    Convenience: fetch current Daily games; if 'game_url' provided, choose that one;
-    else choose the first with a FEN. Returns full analysis result.
+    Fetch current Daily games; pick one (by url if provided, else first with FEN).
+    If no FEN is present but a PGN url exists, fetch the PGN and build the board.
     """
     lst = await chesscom_current_games(username)
     if isinstance(lst, JSONResponse):
         return lst
     games = lst.get("games", [])
+    if not games:
+        return JSONResponse({"error": "no_current_games"}, status_code=404)
+
     choose = None
     if game_url:
         for g in games:
             if g.get("url") == game_url:
                 choose = g; break
-    if not choose and games:
-        choose = next((g for g in games if g.get("fen")), games[0])
-    if not choose or not choose.get("fen"):
-        return JSONResponse({"error": "no_fen_in_current_games", "hint": "Ask user for FEN or PGN."}, status_code=404)
-    board = chess.Board(choose["fen"])
-    return _analyze_board(board, choose["fen"])
+    if not choose:
+        choose = next((g for g in games if g.get("fen")), None) or games[0]
 
-# ---------- health & privacy ----------
+    # Priority: FEN
+    fen = choose.get("fen")
+    if fen:
+        board = chess.Board(fen)
+        return _analyze_board(board, fen)
+
+    # Fallback: PGN -> board
+    pgn_url = choose.get("pgn_url")
+    if pgn_url:
+        data = await _httpx_get_json(pgn_url)
+        if not isinstance(data, JSONResponse) and isinstance(data, dict) and "pgn" in data:
+            board = _board_from_pgn_text(data["pgn"])
+            if board:
+                return _analyze_board(board, board.fen())
+
+    return JSONResponse({
+        "error": "no_fen_or_pgn",
+        "hint": "Ask user for FEN/PGN or upload a screenshot."
+    }, status_code=404)
+
+# ---------- health & help ----------
 PRIVACY_HTML = """
 <!doctype html>
 <meta charset="utf-8">
@@ -301,13 +356,13 @@ PRIVACY_HTML = """
 </style>
 <h1>Help – Getting a Position</h1>
 <ol>
-<li><b>Chess.com username (Daily games):</b> Give your username and I’ll list your in-progress Daily games so you can pick one.</li>
+<li><b>Chess.com username (Daily games):</b> I can list your in-progress Daily games so you can pick one.</li>
 <li><b>FEN:</b> Chess.com (web) → <i>Game</i> → <i>Settings</i> → <i>Share</i> → <i>FEN</i>.</li>
 <li><b>PGN:</b> Chess.com (web) → <i>Game</i> → <i>Settings</i> → <i>Share</i> → <i>PGN</i>.</li>
 <li><b>Screenshot:</b> Top-down image of the full board; I’ll ask castling/en-passant if needed.</li>
 </ol>
 <h2>Privacy</h2>
-<p>We use your input only to analyze the position. No selling or advertising. Logs contain standard metadata for security and debugging.</p>
+<p>We use your input only to analyze the position. Logs contain basic metadata for security and debugging.</p>
 <p>Contact: <a href="mailto:chesscoachgpt.help@gmail.com">chesscoachgpt.help@gmail.com</a></p>
 """
 
