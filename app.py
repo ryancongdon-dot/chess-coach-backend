@@ -1,30 +1,26 @@
 import os
 import io
-import json
-import logging
-from typing import Optional, List
+from typing import List, Optional
 
-import requests
-import chess
-import chess.pgn
+import httpx
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import chess
+import chess.engine
+import chess.pgn
 
-# --------------------------------------------------
+# ------------------------------------------------------------------------------
 # Config
-# --------------------------------------------------
+# ------------------------------------------------------------------------------
 
-STOCKFISH_PATH = os.getenv("STOCKFISH_PATH", "/usr/games/stockfish")
+STOCKFISH_PATH = os.getenv("STOCKFISH_PATH", "/usr/bin/stockfish")
 STOCKFISH_SECONDS = float(os.getenv("STOCKFISH_SECONDS", "1.4"))
-USE_CLOUD = int(os.getenv("USE_CLOUD", "0"))
-USE_EXPLORER = int(os.getenv("USE_EXPLORER", "1"))
 
-CLOUD_STOCKFISH_URL = "https://stockfish.online/api/s/v2.php"
-CHESSCOM_CURRENT_GAMES_URL = "https://api.chess.com/pub/player/{username}/games"
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("chess-coach")
+CHESSCOM_HEADERS = {
+    "User-Agent": "ChessCoach/1.0 (+https://chess-coach.onrender.com)",
+    "Accept": "application/json",
+}
 
 app = FastAPI(title="Chess Coach Backend", version="1.0.0")
 
@@ -35,18 +31,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# --------------------------------------------------
+# ------------------------------------------------------------------------------
 # Models
-# --------------------------------------------------
+# ------------------------------------------------------------------------------
 
 class AnalyzeJsonRequest(BaseModel):
     fen: str
-    side: Optional[str] = None  # "w" / "b" / "white" / "black"
+    side: Optional[str] = None  # w / b / white / black
 
 
 class AnalyzeFromMovesRequest(BaseModel):
-    moves: str  # full PGN or SAN string
+    moves: str  # SAN/PGN text
     start_fen: Optional[str] = None
 
 
@@ -54,360 +49,301 @@ class ChesscomCurrentGamesRequest(BaseModel):
     username: str
 
 
-# --------------------------------------------------
-# Helpers: Engine
-# --------------------------------------------------
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
 
-def run_local_stockfish(fen: str, side: Optional[str] = None, multi_pv: int = 3):
-    """Run Stockfish inside the container and return a small JSON summary."""
-    if not os.path.exists(STOCKFISH_PATH):
-        raise RuntimeError(f"Stockfish binary not found at {STOCKFISH_PATH}")
+def _score_to_cp(score: chess.engine.PovScore) -> float:
+    """
+    Convert Stockfish score to centipawns from White's POV.
+    Positive = good for White, negative = good for Black.
+    """
+    # Handle mate scores with a big number, but keep sign.
+    if score.is_mate():
+        mate_in = score.white().mate()
+        if mate_in is None:
+            return 0.0
+        # Mate in N -> big cp with sign
+        return 10000.0 if mate_in > 0 else -10000.0
+    return float(score.white().score(mate_score=10000))
 
-    import subprocess
 
-    # Basic UCI session
+def _pv_to_san(board: chess.Board, pv: List[chess.Move]) -> str:
+    tmp = board.copy()
+    san_moves: List[str] = []
+    for mv in pv:
+        try:
+            san_moves.append(tmp.san(mv))
+            tmp.push(mv)
+        except Exception:
+            break
+    return " ".join(san_moves)
+
+
+def run_local_engine(fen: str) -> dict:
+    """
+    Run Stockfish on the given FEN and return a normalized response.
+    """
     try:
-        sf = subprocess.Popen(
-            [STOCKFISH_PATH],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
+        board = chess.Board(fen)
+    except Exception:
+        return {
+            "fen": fen,
+            "engine_ok": False,
+            "engine_source": "local",
+            "engine_error": "invalid_fen",
+            "suggestions": [],
+        }
+
+    if not os.path.exists(STOCKFISH_PATH):
+        return {
+            "fen": fen,
+            "engine_ok": False,
+            "engine_source": "local",
+            "engine_error": f"stockfish_not_found_at_{STOCKFISH_PATH}",
+            "suggestions": [],
+        }
+
+    try:
+        engine = chess.engine.SimpleEngine.popen_uci([STOCKFISH_PATH])
     except Exception as e:
-        raise RuntimeError(f"Failed to start Stockfish: {e}")
+        return {
+            "fen": fen,
+            "engine_ok": False,
+            "engine_source": "local",
+            "engine_error": f"engine_start_failed: {e}",
+            "suggestions": [],
+        }
 
-    def send(cmd: str):
-        sf.stdin.write(cmd + "\n")
-        sf.stdin.flush()
+    try:
+        limit = chess.engine.Limit(time=STOCKFISH_SECONDS)
+        info_list = engine.analyse(board, limit=limit, multipv=3)
+    except Exception as e:
+        engine.quit()
+        return {
+            "fen": fen,
+            "engine_ok": False,
+            "engine_source": "local",
+            "engine_error": f"engine_analysis_failed: {e}",
+            "suggestions": [],
+        }
 
-    def read_lines():
-        lines = []
-        while True:
-            line = sf.stdout.readline()
-            if not line:
-                break
-            line = line.strip()
-            lines.append(line)
-            if line.startswith("bestmove"):
-                break
-        return lines
+    engine.quit()
 
-    send("uci")
-    send("isready")
-    send(f"position fen {fen}")
-    send(f"setoption name MultiPV value {multi_pv}")
-    send(f"go movetime {int(STOCKFISH_SECONDS * 1000)}")
-
-    lines = read_lines()
-    sf.kill()
-
-    # Parse "info" lines
     suggestions = []
-    for line in lines:
-        if " pv " in line and "score " in line:
-            parts = line.split()
-            try:
-                idx_pv = parts.index("pv")
-            except ValueError:
-                continue
-            pv_moves = parts[idx_pv + 1:]
-            # naive cp/mate extract
-            eval_cp = None
-            if "cp" in parts:
-                eval_cp = int(parts[parts.index("cp") + 1]) / 100.0
-            elif "mate" in parts:
-                mate = int(parts[parts.index("mate") + 1])
-                eval_cp = 1000.0 if mate > 0 else -1000.0
+    for info in info_list:
+        if "pv" not in info or "score" not in info:
+            continue
+        pv = info["pv"]
+        score = info["score"]
+        eval_cp = _score_to_cp(score)
+        pv_san = _pv_to_san(board, pv)
+        best_move_san = pv_san.split(" ")[0] if pv_san else None
 
-            # convert PV to SAN for readability
-            try:
-                board = chess.Board(fen)
-                san_moves = []
-                for u in pv_moves:
-                    move = board.parse_uci(u)
-                    san_moves.append(board.san(move))
-                    board.push(move)
-                pv_san = " ".join(san_moves)
-            except Exception:
-                pv_san = " ".join(pv_moves)
-
-            suggestions.append(
-                {
-                    "pv": pv_moves,
-                    "pv_san": pv_san,
-                    "eval": eval_cp,
-                }
-            )
-
-    best_move_san = suggestions[0]["pv_san"].split()[0] if suggestions else None
+        suggestions.append(
+            {
+                "pv_san": pv_san,
+                "eval": eval_cp / 100.0,  # convert to pawns
+                "best_move_san": best_move_san,
+            }
+        )
 
     return {
-        "engine_ok": True,
-        "engine_source": "local",
         "fen": fen,
-        "side_to_move": side,
+        "engine_ok": True if suggestions else False,
+        "engine_source": "local",
+        "engine_error": None if suggestions else "no_suggestions",
         "suggestions": suggestions,
-        "best_move_san": best_move_san,
     }
 
 
-def run_engine(fen: str, side: Optional[str] = None):
-    """Top-level engine wrapper. Local SF first; optionally cloud fallback."""
-    try:
-        result = run_local_stockfish(fen, side)
-        return result
-    except Exception as e:
-        logger.error(f"Local engine error: {e}")
-        if USE_CLOUD:
-            try:
-                r = requests.get(
-                    CLOUD_STOCKFISH_URL,
-                    params={"fen": fen, "depth": 16},
-                    timeout=8,
-                )
-                data = r.json()
-                return {
-                    "engine_ok": True,
-                    "engine_source": "cloud",
-                    "fen": fen,
-                    "raw": data,
-                }
-            except Exception as ce:
-                logger.error(f"Cloud engine error: {ce}")
-                return {
-                    "engine_ok": False,
-                    "engine_source": "none",
-                    "engine_error": str(ce),
-                    "fen": fen,
-                }
-        else:
-            return {
-                "engine_ok": False,
-                "engine_source": "local",
-                "engine_error": str(e),
-                "fen": fen,
-            }
+def build_board_from_moves(moves_text: str, start_fen: Optional[str]) -> Optional[chess.Board]:
+    """
+    Try to build a board from SAN/PGN text.
 
-
-# --------------------------------------------------
-# Helpers: Moves / PGN parsing
-# --------------------------------------------------
-
-def board_from_full_pgn(pgn_text: str) -> Optional[chess.Board]:
-    """Try to parse a full PGN (with headers) or bare PGN text."""
-    pgn_io = io.StringIO(pgn_text)
-    game = chess.pgn.read_game(pgn_io)
-    if game is None:
+    - First, try full PGN parsing.
+    - If that fails, treat it as a sequence of SAN moves.
+    """
+    text = moves_text.strip()
+    if not text:
         return None
-    board = game.board()
-    for move in game.mainline_moves():
-        board.push(move)
-    return board
 
+    # 1) Try PGN
+    try:
+        game = chess.pgn.read_game(io.StringIO(text))
+        if game is not None:
+            board = game.end().board()
+            return board
+    except Exception:
+        pass
 
-def board_from_san_sequence(moves_text: str, start_fen: Optional[str]) -> chess.Board:
-    """Parse a SAN move sequence like '1. e4 e5 2. Nf3 Nc6' from a given start FEN or initial."""
+    # 2) Fallback: SAN sequence
     board = chess.Board(start_fen) if start_fen else chess.Board()
+    tokens = [t for t in text.replace("\n", " ").split(" ") if t]
 
-    # crude tokenization: remove comments and results
-    cleaned = []
-    token = ""
-    in_comment = False
-    for ch in moves_text:
-        if ch == "{":
-            in_comment = True
-        elif ch == "}":
-            in_comment = False
-        elif not in_comment:
-            cleaned.append(ch)
-    text = "".join(cleaned)
-
-    tokens = text.replace("\n", " ").split()
-    for t in tokens:
-        if t.endswith("."):
-            continue  # move number
-        if t in ["1-0", "0-1", "1/2-1/2", "*"]:
-            break
+    for tok in tokens:
+        # Skip move numbers and results
+        if tok.endswith(".") or tok in ["1-0", "0-1", "1/2-1/2", "*"]:
+            continue
         try:
-            board.push_san(t)
+            move = board.parse_san(tok)
+            board.push(move)
         except Exception:
-            # if something is weird, stop before we explode
+            # Stop at first bad token
             break
+
     return board
 
 
-def board_from_moves_payload(moves: str, start_fen: Optional[str]) -> chess.Board:
-    moves = moves.strip()
-
-    # 1) Try as full PGN (handles both real PGN + simple SAN strings)
-    board = board_from_full_pgn(moves)
-    if board is not None:
-        return board
-
-    # 2) Fallback: manual SAN parsing from start_fen / initial position
-    return board_from_san_sequence(moves, start_fen)
-
-
-# --------------------------------------------------
+# ------------------------------------------------------------------------------
 # Endpoints
-# --------------------------------------------------
+# ------------------------------------------------------------------------------
 
 @app.get("/healthz")
 def healthz():
+    """
+    Simple health check: verifies Stockfish binary exists and can be started.
+    """
     ok = os.path.exists(STOCKFISH_PATH)
+    detail = "ok" if ok else f"Stockfish not found at {STOCKFISH_PATH}"
     return {
         "ok": ok,
         "engine_path": STOCKFISH_PATH,
+        "detail": detail,
     }
 
 
 @app.post("/analyzeJson")
-def analyze_json(body: AnalyzeJsonRequest):
-    side = body.side
-    if side:
-        side = side.lower()
-        if side in ("white", "w"):
-            side = "w"
-        elif side in ("black", "b"):
-            side = "b"
-        else:
-            side = None
-
-    result = run_engine(body.fen, side)
+def analyze_json(req: AnalyzeJsonRequest):
+    """
+    Analyze a chess position from FEN.
+    """
+    result = run_local_engine(req.fen)
+    # side is optional; GPT can use FEN's side-to-move field directly.
     return result
 
 
 @app.post("/analyze")
 async def analyze_multipart(
-    fen: Optional[str] = Form(None),
-    side: Optional[str] = Form(None),
-    image: Optional[UploadFile] = File(None),
+    fen: Optional[str] = Form(default=None),
+    side: Optional[str] = Form(default=None),
+    image: Optional[UploadFile] = File(default=None),
 ):
-    # Right now we ignore image (no board OCR) and require fen if provided.
-    if not fen:
-        return {
-            "engine_ok": False,
-            "engine_source": "none",
-            "needs_fen": True,
-            "message": "No FEN provided. Please supply fen or use analyzeJson.",
-        }
+    """
+    Analyze from FEN and/or uploaded image (multipart).
 
-    side_norm = None
-    if side:
-        s = side.lower()
-        if s in ("white", "w"):
-            side_norm = "w"
-        elif s in ("black", "b"):
-            side_norm = "b"
+    Current behavior:
+    - If FEN is provided: analyze it.
+    - If only image is provided: respond with needs_fen = true (image->FEN disabled).
+    """
+    if fen:
+        return run_local_engine(fen)
 
-    return run_engine(fen, side_norm)
+    # No FEN: we are not auto-OCRing boards here.
+    return {
+        "ok": False,
+        "needs_fen": True,
+        "message": "Please provide a FEN or PGN; image-only analysis is disabled in this backend.",
+    }
 
 
 @app.post("/analyzeFromMoves")
-def analyze_from_moves(body: AnalyzeFromMovesRequest):
+def analyze_from_moves(req: AnalyzeFromMovesRequest):
     """
-    Accepts either:
-    - Full PGN from Chess.com (with [Event] tags etc), OR
-    - Simple SAN text like `1. e4 e5 2. Nf3 Nc6`, with optional start_fen.
+    Analyze a position by replaying SAN/PGN moves (e.g. from Chess.com).
     """
-    try:
-        board = board_from_moves_payload(body.moves, body.start_fen)
-    except Exception as e:
-        logger.error(f"Error parsing moves: {e}")
-        return {
-            "engine_ok": False,
-            "engine_source": "none",
-            "parse_error": f"Could not parse moves: {e}",
-        }
-
+    board = build_board_from_moves(req.moves, req.start_fen)
     if board is None:
         return {
             "engine_ok": False,
-            "engine_source": "none",
-            "parse_error": "Could not parse moves / PGN.",
+            "engine_source": "local",
+            "engine_error": "could_not_parse_moves",
+            "suggestions": [],
         }
 
     fen = board.fen()
-    result = run_engine(fen, side="w" if board.turn == chess.WHITE else "b")
-    result["from_moves"] = True
-    result["final_fen"] = fen
-    return result
+    return run_local_engine(fen)
 
 
 @app.post("/chesscom/currentGames")
-def chesscom_current_games(body: ChesscomCurrentGamesRequest):
+def chesscom_current_games(req: ChesscomCurrentGamesRequest):
     """
-    Fetch current Daily games for a Chess.com user.
-    Returns compact JSON with opponent, whose move, FEN, PGN, and URL.
-    """
-    username = body.username.strip()
-    if not username:
-        return {"error": "username is required"}
+    Fetch current Daily games for a Chess.com user and return a compact list.
 
-    url = CHESSCOM_CURRENT_GAMES_URL.format(username=username)
+    This is what your GPT should use to:
+    - List games with numbers.
+    - Then pick one, grab its PGN, and call /analyzeFromMoves.
+    """
+    username = req.username.strip()
+    url = f"https://api.chess.com/pub/player/{username}/games"
+
     try:
-        resp = requests.get(url, timeout=8)
-        if resp.status_code != 200:
-            return {
-                "error": f"Chess.com returned {resp.status_code}",
-                "status_code": resp.status_code,
-            }
-        data = resp.json()
+        resp = httpx.get(url, headers=CHESSCOM_HEADERS, timeout=8.0)
     except Exception as e:
-        logger.error(f"Error calling Chess.com: {e}")
-        return {"error": f"Failed to contact Chess.com: {e}"}
+        return {
+            "error": f"request_failed: {e.__class__.__name__}",
+            "status_code": 500,
+        }
 
-    games_raw = data.get("games", [])
-    games: List[dict] = []
+    if resp.status_code == 403:
+        return {
+            "error": "chesscom_forbidden",
+            "status_code": 403,
+            "message": (
+                "Chess.com returned 403 (forbidden) when fetching games. "
+                "This may be due to temporary API protection or privacy settings."
+            ),
+        }
 
-    for g in games_raw:
-        pgn = g.get("pgn", "")
-        fen = g.get("fen") or None
-        url = g.get("url")
-        white = g.get("white", "")
-        black = g.get("black", "")
-        time_class = g.get("time_class", "")
-        rules = g.get("rules", "chess")
+    if resp.status_code != 200:
+        return {
+            "error": f"chesscom_status_{resp.status_code}",
+            "status_code": resp.status_code,
+            "body": resp.text[:400],
+        }
 
-        # Extract names from API URLs if needed
-        def name_from(url_or_name: str) -> str:
-            if not url_or_name:
-                return ""
-            if "/" in url_or_name:
-                return url_or_name.rstrip("/").split("/")[-1]
-            return url_or_name
+    data = resp.json()
+    games = data.get("games") or []
 
-        white_name = name_from(white)
-        black_name = name_from(black)
+    compact_games = []
+    for g in games:
+        pgn = g.get("pgn") or ""
+        fen = g.get("fen") or ""
+        url_g = g.get("url") or g.get("link") or ""
+        white = (g.get("white") or "").split("/")[-1]
+        black = (g.get("black") or "").split("/")[-1]
+        turn = g.get("turn")  # "white" or "black"
 
-        # Whose move from FEN if present
-        whose_move = None
+        # Small human summary:
+        summary = ""
         if fen:
-            try:
-                turn = fen.split()[1]
-                if turn == "w":
-                    whose_move = "white"
-                elif turn == "b":
-                    whose_move = "black"
-            except Exception:
-                pass
+            summary = fen
+        elif pgn:
+            parts = pgn.split("\n\n", 1)
+            if len(parts) == 2:
+                moves = parts[1].strip().split()
+                summary = " ".join(moves[:14])
 
-        games.append(
+        whose = None
+        if turn == "white":
+            whose = "White to move"
+        elif turn == "black":
+            whose = "Black to move"
+
+        compact_games.append(
             {
-                "url": url,
+                "url": url_g,
+                "white": white,
+                "black": black,
+                "turn": turn,
+                "whose_move": whose,
                 "fen": fen,
                 "pgn": pgn,
-                "white": white_name,
-                "black": black_name,
-                "whose_move": whose_move,
-                "time_class": time_class,
-                "rules": rules,
+                "summary": summary,
             }
         )
 
     return {
-        "username": username,
-        "count": len(games),
-        "games": games,
+        "count": len(compact_games),
+        "games": compact_games,
     }
